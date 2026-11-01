@@ -64,7 +64,30 @@ brew install ripsecrets
 
 ### Pre-built
 
-You can download a prebuilt binary for the latest release from the [releases](https://github.com/sirwart/ripsecrets/releases) page.
+You can download a prebuilt binary for the latest release from the
+[releases](https://github.com/FlavioAmurrioCS/ripsecrets/releases) page.
+
+Each archive contains the `ripsecrets` binary, its man page, and shell
+completions. Archives are named for the platform, e.g.
+`ripsecrets-0.1.11-linux-x64.tar.gz` (x86_64 Linux, statically linked),
+`ripsecrets-0.1.11-linux-arm64.tar.gz` (aarch64 Linux, statically linked),
+`ripsecrets-0.1.11-darwin-arm64.tar.gz`, and
+`ripsecrets-0.1.11-darwin-x64.tar.gz`.
+
+Verify a download against `SHASUMS256.txt` from the same release:
+
+```sh
+shasum -a 256 -c SHASUMS256.txt
+```
+
+Releases also carry a signed `packslip.sigstore.json`; if you have
+[packslip](https://packslip.dev) installed, you can verify a release's
+provenance — that these files were built and signed by this repository's CI —
+with:
+
+```sh
+packslip verify packslip.sigstore.json --artifact ripsecrets-*linux-x64.tar.gz
+```
 
 ### Cargo
 

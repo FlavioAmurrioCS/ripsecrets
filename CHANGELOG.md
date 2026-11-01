@@ -1,3 +1,9 @@
+## Unreleased
+
+- Build and attach prebuilt release archives (linux-x64, linux-arm64,
+  darwin-arm64, darwin-x64) on `v*` tags via GitHub Actions
+- Sign releases with packslip and attach build provenance attestations
+
 ## 0.1.11 (2025-05-27)
 
 - Fix Cargo.lock file
