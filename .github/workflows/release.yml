@@ -11,14 +11,31 @@ on:
         description: "The tag to emulate"
         required: true
         type: string
+      publish:
+        description: "Whether to publish the draft release after signing (set false for a trial run)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Tag releases are never cancelled; dispatch runs for the same tag replace
+# each other so the newest workflow revision wins.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   determine-tag:
     name: Determine tag to use
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
     outputs:
       ref: ${{ steps.on-push.outputs.tag }}
       input: ${{ steps.on-workflow.outputs.tag }}
+      tag: ${{ steps.on-push.outputs.tag || steps.on-workflow.outputs.tag }}
       version: ${{ steps.combine.outputs.version }}
 
     steps:
@@ -48,6 +65,7 @@ jobs:
   build-oci:
     name: Build OCI image
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs:
       - determine-tag
 
@@ -70,9 +88,11 @@ jobs:
   publish-oci:
     name: Push to Docker Hub
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs:
       - determine-tag
       - build-oci
+    permissions: {}
 
     steps:
       - name: Log in to Docker Hub
@@ -102,6 +122,8 @@ jobs:
   publish-crate:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions: {}
 
     steps:
       - uses: actions/checkout@v5
@@ -115,3 +137,230 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
         run: nix develop --command cargo publish
+
+  build-binaries:
+    name: Build release archive for ${{ matrix.os-arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    needs:
+      - determine-tag
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os-arch: linux-x64
+          - runner: ubuntu-24.04-arm
+            os-arch: linux-arm64
+          - runner: macos-15
+            os-arch: darwin-arm64
+          - runner: macos-15-intel
+            os-arch: darwin-x64
+    env:
+      VERSION: ${{ needs.determine-tag.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install and configure Nix
+        uses: cachix/install-nix-action@v25
+
+      - name: Build the release archive
+        run: nix build .#ripsecrets-archive
+
+      - name: Copy archive to a distributable name
+        run: |
+          mkdir -p dist
+          cp result "dist/ripsecrets-${VERSION}-${{ matrix.os-arch }}.tar.gz"
+
+      - name: Smoke test the archive
+        run: |
+          smoke="$(mktemp -d)"
+          tar -xzf dist/ripsecrets-*.tar.gz -C "$smoke"
+          version="$("$smoke/ripsecrets-$VERSION/bin/ripsecrets" --version | awk '{print $NF}')"
+          if [ "$version" != "$VERSION" ]; then
+            echo "::error::Archive reports version $version, expected $VERSION"
+            exit 1
+          fi
+
+      - name: Save the archive
+        uses: actions/upload-artifact@v5
+        with:
+          name: binaries-${{ matrix.os-arch }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
+
+  release-binaries:
+    name: Create the draft release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - determine-tag
+      - build-binaries
+    permissions:
+      contents: write
+    outputs:
+      created: ${{ steps.stage.outputs.created }}
+      release-id: ${{ steps.stage.outputs.release-id }}
+    env:
+      VERSION: ${{ needs.determine-tag.outputs.version }}
+      TAG: ${{ needs.determine-tag.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Collect build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+
+      - name: Stage the release assets
+        id: stage
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ripsecrets-*.tar.gz > SHASUMS256.txt
+          cd ..
+
+          # The release is kept a draft through signing; security best practice
+          # for repositories with immutable releases, and it lets the final job
+          # verify every asset digest before users ever see the release.
+          if [ "$(gh release view "$TAG" --json draft --jq '.draft' 2>/dev/null)" = "true" ]; then
+            echo "Refresh assets of the existing draft for $TAG"
+            gh release upload "$TAG" --clobber dist/ripsecrets-*.tar.gz dist/SHASUMS256.txt
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$(gh release view "$TAG" --json name --jq '.name' 2>/dev/null)" ]; then
+            echo "::warning::Release $TAG already exists and is published; skipping"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            gh release create "$TAG" \
+              --draft \
+              --title "ripsecrets $VERSION" \
+              --generate-notes \
+              dist/ripsecrets-*.tar.gz \
+              dist/SHASUMS256.txt
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "release-id=$(gh release view "$TAG" --json id --jq '.id')" >> "$GITHUB_OUTPUT"
+
+      - name: Stage the release for the packslip job
+        if: steps.stage.outputs.created == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: release-assets
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
+
+  packslip:
+    name: Sign the release with packslip
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+      - determine-tag
+      - release-binaries
+    if: needs.release-binaries.outputs.created == 'true'
+    permissions:
+      contents: write # attach the signed bundle to the draft release
+      id-token: write # sign with the workflow's identity
+      attestations: write # build provenance for the collected artifacts
+    env:
+      TAG: ${{ needs.determine-tag.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Collect release assets
+        uses: actions/download-artifact@v5
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Remove a previously attached bundle
+        run: |
+          gh release delete-asset "$TAG" packslip.sigstore.json --yes 2>/dev/null || true
+
+      # The signed statement records every artifact with its digest, the
+      # executable inside it, which platform each file is for, and the
+      # resources (man page, completions) it ships, and signs it with this
+      # workflow's Sigstore identity. A consumer can verify that the file it
+      # is about to install was built by this repository. See
+      # https://packslip.dev.
+      #
+      # attest keeps its default (true): each artifact is attested with
+      # actions/attest-build-provenance and linked from the bundle. upload
+      # keeps its default (true): packslip.sigstore.json is attached to the
+      # release itself.
+      #
+      # NB: this step must keep running from this workflow file: consumers
+      # pin the signer's workflow, and moving it elsewhere makes them ask a
+      # person to approve the next release.
+      - uses: jdx/packslip@693d02c49f6e1c8a0cc797472dc3fa53f0a6c955 # v1.9.1
+        with:
+          artifacts: dist/ripsecrets-*.tar.gz
+          bin: ripsecrets
+          tag: ${{ needs.determine-tag.outputs.tag }}
+          resources: |
+            man=archive:ripsecrets-${{ needs.determine-tag.outputs.version }}/share/man/man1/ripsecrets.1
+            completion/bash=archive:ripsecrets-${{ needs.determine-tag.outputs.version }}/share/bash-completion/completions/ripsecrets
+            completion/zsh=archive:ripsecrets-${{ needs.determine-tag.outputs.version }}/share/zsh/site-functions/_ripsecrets
+            completion/fish=archive:ripsecrets-${{ needs.determine-tag.outputs.version }}/share/fish/vendor_completions.d/ripsecrets.fish
+
+  publish-binaries:
+    name: Verify assets and publish the release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - determine-tag
+      - release-binaries
+      - packslip
+    if: ${{ !cancelled() && needs.release-binaries.outputs.created == 'true' && needs.packslip.result == 'success' }}
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.determine-tag.outputs.tag }}
+      RELEASE_ID: ${{ needs.release-binaries.outputs.release-id }}
+      # On a tag push, always publish. Dispatches decide for themselves so a
+      # trial run can be inspected manually before it is published.
+      PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Collect release assets
+        uses: actions/download-artifact@v5
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Download the signed bundle
+        run: gh release download "$TAG" --pattern packslip.sigstore.json --dir dist
+
+      # Compare every asset of the draft against the files this workflow
+      # built, so a stale archive or a wrong upload is caught before the
+      # release goes public.
+      - name: Verify uploaded assets match the built files
+        run: |
+          set -euo pipefail
+          expected="$(cd dist && sha256sum ./* | sort)"
+          actual="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+            --jq '.assets[] | select(.digest | startswith("sha256:")) | "\(.digest[7:])  \(.name)"' \
+            | sort)"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::Draft release assets do not match the built files"
+            diff <(echo "$expected") <(echo "$actual") || true
+            exit 1
+          fi
+
+      - name: Publish the draft release
+        if: env.PUBLISH == 'true'
+        run: |
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false
+          echo "Published $TAG"
+
+      - name: Release left as a draft for review
+        if: env.PUBLISH != 'true'
+        run: |
+          echo "publish input was false; leaving release $TAG as a draft for review"
