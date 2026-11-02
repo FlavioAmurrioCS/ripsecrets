@@ -90,39 +90,97 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux binaries are statically linked against musl so they run on
+          # any distro.
           - runner: ubuntu-latest
             os-arch: linux-x64
+            target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
             os-arch: linux-arm64
+            target: aarch64-unknown-linux-musl
           - runner: macos-15
             os-arch: darwin-arm64
+            target: aarch64-apple-darwin
           - runner: macos-15-intel
             os-arch: darwin-x64
+            target: x86_64-apple-darwin
     env:
       VERSION: ${{ needs.determine-tag.outputs.version }}
+      TARGET: ${{ matrix.target }}
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
-      - name: Install and configure Nix
-        uses: cachix/install-nix-action@v31
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-      - name: Build the release archive
-        run: nix build .#ripsecrets-archive
+      - name: Install musl tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Copy archive to a distributable name
+      - name: Build the release binary
+        run: cargo build --release --locked --target "$TARGET"
+
+      # Layout:
+      #
+      #   ripsecrets-<version>/bin/ripsecrets
+      #   ripsecrets-<version>/share/man/man1/ripsecrets.1
+      #   ripsecrets-<version>/share/{bash-completion/completions, zsh/site-functions, fish/vendor_completions.d}/...
+      - name: Assemble the release archive
         run: |
+          set -euo pipefail
+          # build.rs writes the man page and completions into OUT_DIR.
+          out_dir="$(dirname "$(find "target/$TARGET/release/build" -path '*/out/ripsecrets.1' -print -quit)")"
+          root="ripsecrets-${VERSION}"
+          # macOS install(1) has no -D, so create the directories first.
+          mkdir -p "$root/bin" "$root/share/man/man1" \
+            "$root/share/bash-completion/completions" \
+            "$root/share/zsh/site-functions" \
+            "$root/share/fish/vendor_completions.d"
+          install -m0755 "target/$TARGET/release/ripsecrets" "$root/bin/ripsecrets"
+          install -m0644 "$out_dir/ripsecrets.1" "$root/share/man/man1/ripsecrets.1"
+          install -m0644 "$out_dir/ripsecrets.bash" "$root/share/bash-completion/completions/ripsecrets"
+          install -m0644 "$out_dir/_ripsecrets" "$root/share/zsh/site-functions/_ripsecrets"
+          install -m0644 "$out_dir/ripsecrets.fish" "$root/share/fish/vendor_completions.d/ripsecrets.fish"
+
+          # BSD tar on macOS lacks the options for a reproducible archive.
+          tar=tar
+          if [ "$RUNNER_OS" = macOS ]; then
+            command -v gtar >/dev/null || brew install gnu-tar
+            tar=gtar
+          fi
           mkdir -p dist
-          cp result "dist/ripsecrets-${VERSION}-${{ matrix.os-arch }}.tar.gz"
+          GZIP=-n "$tar" -czf "dist/ripsecrets-${VERSION}-${{ matrix.os-arch }}.tar.gz" \
+            --sort=name --format=gnu --owner=0 --group=0 --mtime='@0' "$root"
 
       - name: Smoke test the archive
         run: |
+          set -euo pipefail
           smoke="$(mktemp -d)"
           tar -xzf dist/ripsecrets-*.tar.gz -C "$smoke"
-          version="$("$smoke/ripsecrets-$VERSION/bin/ripsecrets" --version | awk '{print $NF}')"
+          bin="$smoke/ripsecrets-$VERSION/bin/ripsecrets"
+          version="$("$bin" --version | awk '{print $NF}')"
           if [ "$version" != "$VERSION" ]; then
             echo "::error::Archive reports version $version, expected $VERSION"
             exit 1
+          fi
+          # Fail on any library a stock install of the OS would not have.
+          if [ "$RUNNER_OS" = macOS ]; then
+            otool -L "$bin"
+            if otool -L "$bin" | tail -n +2 | grep -vE '^\s*/(usr/lib|System/Library)/'; then
+              echo "::error::Binary links against non-system libraries"
+              exit 1
+            fi
+          else
+            file "$bin"
+            if ! file "$bin" | grep -qE 'statically linked|static-pie linked'; then
+              echo "::error::Linux binary is not statically linked"
+              exit 1
+            fi
           fi
 
       - name: Save the archive
