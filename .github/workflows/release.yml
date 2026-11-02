@@ -189,7 +189,10 @@ jobs:
               dist/SHASUMS256.txt
             echo "created=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "release-id=$(gh release view "$TAG" --json id --jq '.id')" >> "$GITHUB_OUTPUT"
+          # The numeric REST id: drafts are not reachable via releases/tags/<tag>.
+          release_id="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .id")"
+          echo "release-id=$release_id" >> "$GITHUB_OUTPUT"
 
       - name: Stage the release for the packslip job
         if: steps.stage.outputs.created == 'true'
@@ -292,8 +295,8 @@ jobs:
       - name: Verify uploaded assets match the built files
         run: |
           set -euo pipefail
-          expected="$(cd dist && sha256sum ./* | sort)"
-          actual="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+          expected="$(cd dist && sha256sum -- * | sort)"
+          actual="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             --jq '.assets[] | select(.digest | startswith("sha256:")) | "\(.digest[7:])  \(.name)"' \
             | sort)"
           if [ "$expected" != "$actual" ]; then
