@@ -149,6 +149,8 @@ jobs:
       VERSION: ${{ needs.determine-tag.outputs.version }}
       TAG: ${{ needs.determine-tag.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
+      # These jobs have no checkout, so gh cannot infer the repository.
+      GH_REPO: ${{ github.repository }}
 
     steps:
       - name: Collect build artifacts
@@ -180,6 +182,7 @@ jobs:
           else
             gh release create "$TAG" \
               --draft \
+              --target "$GITHUB_SHA" \
               --title "ripsecrets $VERSION" \
               --generate-notes \
               dist/ripsecrets-*.tar.gz \
@@ -212,6 +215,8 @@ jobs:
     env:
       TAG: ${{ needs.determine-tag.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
+      # These jobs have no checkout, so gh cannot infer the repository.
+      GH_REPO: ${{ github.repository }}
 
     steps:
       - name: Collect release assets
@@ -268,6 +273,8 @@ jobs:
       # trial run can be inspected manually before it is published.
       PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
       GH_TOKEN: ${{ github.token }}
+      # These jobs have no checkout, so gh cannot infer the repository.
+      GH_REPO: ${{ github.repository }}
 
     steps:
       - name: Collect release assets
